@@ -1,0 +1,80 @@
+# Custom tns-csi image: v0.17.6 driver + open-iscsi 2.1.11 (musl) overlay.
+#
+# Why: the stock bfenski/tns-csi:v0.17.6 image ships iscsiadm 2.1.10 (Alpine),
+# which HANGS in the iscsiadm<->iscsid management IPC against the Talos
+# iscsi-tools extension's iscsid 2.1.11. See fenio/tns-csi#194.
+# We rebuild the same driver but overlay a source-built open-iscsi 2.1.11
+# (matching the node), so the client<->daemon IPC versions agree.
+#
+# Build FROM the fenio/tns-csi repo checked out at the v0.17.6 tag:
+#   git clone --depth 1 -b v0.17.6 https://github.com/fenio/tns-csi
+#   cp Dockerfile.tns-csi-oiscsi2.1.11 tns-csi/
+#   cd tns-csi
+#   docker buildx build --platform linux/amd64 \
+#     -f Dockerfile.tns-csi-oiscsi2.1.11 \
+#     -t <REGISTRY>/tns-csi:v0.17.6-oiscsi2.1.11 --push .
+
+# ---- Stage 1: build the Go driver (unchanged from upstream) ----
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=v0.17.6-oiscsi2.1.11
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+WORKDIR /workspace
+RUN apk add --no-cache make git
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} BUILD_DATE=${BUILD_DATE} \
+    make build
+
+# ---- Stage 2: build open-iscsi 2.1.11 from source on musl ----
+# Recipe derived from Alpine's own open-iscsi APKBUILD (kept musl-correct:
+# -DGLOB_ONLYDIR=0, -Dno_systemd=true), retargeted to the 2.1.11 git tag.
+FROM alpine:3.24 AS iscsi
+ARG OPENISCSI_REF=2.1.11
+RUN apk add --no-cache \
+      build-base meson ninja pkgconf bash perl git \
+      kmod-dev linux-headers openssl-dev open-isns-dev util-linux-dev
+RUN git clone --depth 1 -b "$OPENISCSI_REF" https://github.com/open-iscsi/open-iscsi /src
+WORKDIR /src
+RUN CFLAGS="-DGLOB_ONLYDIR=0" meson setup output \
+      --prefix=/usr --libdir=/usr/lib --sbindir=/usr/sbin \
+      --sysconfdir=/etc --localstatedir=/var --buildtype=plain \
+      -Dno_systemd=true -Drulesdir=/usr/lib/udev/rules.d \
+ && meson compile -C output \
+ && DESTDIR=/out meson install --no-rebuild -C output
+# Sanity: the freshly built binary must report the requested version
+RUN LD_LIBRARY_PATH=/out/usr/lib /out/usr/sbin/iscsiadm --version | grep -q "$OPENISCSI_REF"
+
+# ---- Stage 3: final image (upstream final stage + iscsiadm overlay) ----
+FROM alpine:3.24
+# apk exit code 4 = trigger scripts failed under emulation but packages installed (upstream note)
+RUN apk add --no-cache \
+    ca-certificates \
+    nfs-utils \
+    e2fsprogs \
+    e2fsprogs-extra \
+    xfsprogs \
+    xfsprogs-extra \
+    blkid \
+    util-linux \
+    eudev \
+    nvme-cli \
+    open-iscsi \
+    cifs-utils \
+    || [ $? -eq 4 ]
+
+COPY --from=builder /workspace/bin/tns-csi-driver /usr/local/bin/
+
+# Overlay 2.1.11 iscsiadm + its libopeniscsiusr over Alpine's 2.1.10.
+# (Only iscsiadm is needed in-container; iscsid runs on the Talos host.)
+COPY --from=iscsi /out/usr/sbin/iscsiadm /usr/sbin/iscsiadm
+COPY --from=iscsi /out/usr/lib/ /usr/lib/
+# Fail the build if the overlay didn't take:
+ARG OPENISCSI_REF=2.1.11
+RUN iscsiadm --version && iscsiadm --version | grep -q "$OPENISCSI_REF"
+
+ENTRYPOINT ["/usr/local/bin/tns-csi-driver"]
